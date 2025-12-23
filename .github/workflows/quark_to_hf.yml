@@ -1,0 +1,144 @@
+name: Quark to HuggingFace
+
+on:
+  workflow_dispatch: # 允许手动点击运行
+  schedule:
+    - cron: '*/30 * * * *' # 每30分钟自动检查一次有没有新任务
+
+jobs:
+  transfer_job:
+    runs-on: ubuntu-latest
+    # 设置超时时间，防止任务卡死（夸克有时候会卡）
+    timeout-minutes: 360 
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Tools
+      run: |
+        # 安装数据库库、HF库
+        pip install psycopg2-binary huggingface_hub requests
+        # 安装 aria2 (下载神器)
+        sudo apt-get update && sudo apt-get install -y aria2
+
+    - name: Run Transfer Script
+      env:
+        DB_CONNECT: ${{ secrets.DB_CONNECT }}
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # 【注意】这里改成你的 HF 用户名/数据集名，例如: user123/quark-backup
+        HF_REPO_ID: 你的用户名/你的数据集名称
+      run: |
+        python <<EOF
+        import os
+        import psycopg2
+        import subprocess
+        from huggingface_hub import HfApi
+        import time
+
+        # 1. 获取环境配置
+        db_url = os.environ.get("DB_CONNECT")
+        hf_token = os.environ.get("HF_TOKEN")
+        repo_id = os.environ.get("HF_REPO_ID")
+
+        print("Connecting to database...")
+        try:
+            conn = psycopg2.connect(db_url)
+            cur = conn.cursor()
+            
+            # 2. 捞取一个未处理的任务 (status = 'pending' 或你在Directus设置的初始状态)
+            # 假设你的 Directus 表名是 "task"，字段有 id, url, status
+            cur.execute("SELECT id, url FROM task WHERE status = 'pending' OR status = '待处理' LIMIT 1")
+            row = cur.fetchone()
+            
+            if row:
+                task_id, file_url = row
+                print(f"Found task ID: {task_id}")
+                print(f"URL: {file_url}")
+                
+                # 3. 标记为“进行中”
+                cur.execute("UPDATE task SET status = 'processing' WHERE id = %s", (task_id,))
+                conn.commit()
+                
+                # 尝试从 URL 提取文件名，如果没有则自动生成
+                # AList 的直链通常包含文件名，例如 http://.../video.mp4
+                try:
+                    from urllib.parse import unquote
+                    filename = unquote(file_url.split('/')[-1].split('?')[0])
+                except:
+                    filename = f"quark_file_{task_id}.bin"
+                
+                print(f"Target Filename: {filename}")
+
+                # 4. 开始下载 (使用 aria2)
+                # 夸克对User-Agent比较敏感，这里模拟浏览器
+                # -x 16: 16线程
+                # -k 1M: 最小分片
+                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                cmd = [
+                    "aria2c", 
+                    "-x", "16", 
+                    "-s", "16", 
+                    "--user-agent", user_agent,
+                    "-o", filename, 
+                    file_url
+                ]
+                
+                print("Start downloading from Quark/AList...")
+                # 允许 aria2 运行较长时间
+                result = subprocess.run(cmd)
+                
+                if result.returncode == 0 and os.path.exists(filename):
+                    file_size = os.path.getsize(filename)
+                    print(f"Download success! Size: {file_size / 1024 / 1024:.2f} MB")
+                    
+                    # 检查文件大小是否超过 GitHub Runner 限制 (约14GB)
+                    if file_size > 13 * 1024 * 1024 * 1024:
+                         print("File too large for GitHub Runner!")
+                         cur.execute("UPDATE task SET status = 'error_too_large' WHERE id = %s", (task_id,))
+                         conn.commit()
+                         exit(1)
+
+                    # 5. 上传到 Hugging Face
+                    print(f"Uploading to HF Dataset: {repo_id}...")
+                    api = HfApi(token=hf_token)
+                    try:
+                        api.upload_file(
+                            path_or_fileobj=filename,
+                            path_in_repo=filename, # 存到 HF 里的文件名
+                            repo_id=repo_id,
+                            repo_type="dataset"
+                        )
+                        print("Upload success!")
+                        
+                        # 6. 标记为“完成”
+                        cur.execute("UPDATE task SET status = 'done' WHERE id = %s", (task_id,))
+                        conn.commit()
+                        
+                        # 清理垃圾
+                        os.remove(filename)
+                        
+                    except Exception as upload_err:
+                        print(f"Upload failed: {upload_err}")
+                        cur.execute("UPDATE task SET status = 'error_upload' WHERE id = %s", (task_id,))
+                        conn.commit()
+                        
+                else:
+                    print("Download failed! Check your AList/Quark link availability.")
+                    cur.execute("UPDATE task SET status = 'error_download' WHERE id = %s", (task_id,))
+                    conn.commit()
+            else:
+                print("No pending tasks found.")
+            
+            cur.close()
+            conn.close()
+
+        except Exception as e:
+            print(f"Script Error: {e}")
+            exit(1)
+        EOF
