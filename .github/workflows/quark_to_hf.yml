@@ -32,7 +32,7 @@ jobs:
         DB_CONNECT: ${{ secrets.DB_CONNECT }}
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
         # 【注意】这里改成你的 HF 用户名/数据集名，例如: user123/quark-backup
-        HF_REPO_ID: 你的用户名/你的数据集名称
+        HF_REPO_ID: zy668/aliss
       run: |
         python <<EOF
         import os
