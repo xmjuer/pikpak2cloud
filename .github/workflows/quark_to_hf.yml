@@ -1,14 +1,13 @@
 name: Quark to HuggingFace
 
 on:
-  workflow_dispatch: # 允许手动点击运行
+  workflow_dispatch: # 手动触发
   schedule:
-    - cron: '*/30 * * * *' # 每30分钟自动检查一次有没有新任务
+    - cron: '*/30 * * * *' # 每30分钟运行
 
 jobs:
   transfer_job:
     runs-on: ubuntu-latest
-    # 设置超时时间，防止任务卡死（夸克有时候会卡）
     timeout-minutes: 360 
 
     steps:
@@ -20,125 +19,143 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Install Tools
+    - name: Install Dependencies
       run: |
-        # 安装数据库库、HF库
         pip install psycopg2-binary huggingface_hub requests
-        # 安装 aria2 (下载神器)
         sudo apt-get update && sudo apt-get install -y aria2
 
-    - name: Run Transfer Script
+    - name: Run Transfer Script Auto-Detect
       env:
         DB_CONNECT: ${{ secrets.DB_CONNECT }}
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        # 【注意】这里改成你的 HF 用户名/数据集名，例如: user123/quark-backup
-        HF_REPO_ID: zy668/aliss
+        # 【重要】请确认这里的 ID 是正确的：用户名/数据集名称
+        HF_REPO_ID: ${{ secrets.HF_REPO_ID }} 
+        # 如果你没在 Secrets 里设置 HF_REPO_ID，可以直接在下面把 os.environ.get 换成你的字符串
+        # 例如: repo_id = "zy668/aliss"
       run: |
         python <<EOF
         import os
         import psycopg2
         import subprocess
         from huggingface_hub import HfApi
-        import time
+        from urllib.parse import unquote
 
-        # 1. 获取环境配置
+        # 1. 获取配置
         db_url = os.environ.get("DB_CONNECT")
         hf_token = os.environ.get("HF_TOKEN")
-        repo_id = os.environ.get("HF_REPO_ID")
+        
+        # 优先读取 Secrets 里的 HF_REPO_ID，如果没有则使用硬编码（请修改此处兜底）
+        repo_id = os.environ.get("HF_REPO_ID") or "zy668/aliss" 
 
-        print("Connecting to database...")
+        print("🚀 连接数据库...")
         try:
             conn = psycopg2.connect(db_url)
             cur = conn.cursor()
             
-            # 2. 捞取一个未处理的任务 (status = 'pending' 或你在Directus设置的初始状态)
-            # 假设你的 Directus 表名是 "task"，字段有 id, url, status
-            cur.execute("SELECT id, url FROM task WHERE status = 'pending' OR status = '待处理' LIMIT 1")
+            # --- 自动侦测表名 (解决 relation does not exist 问题) ---
+            print("正在扫描数据库表结构...")
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            all_tables = [row[0] for row in cur.fetchall()]
+            print(f"📝 当前数据库中的表: {all_tables}")
+
+            target_table = None
+            # 优先级匹配：task -> tasks -> Task -> 包含task的表
+            if 'task' in all_tables: target_table = 'task'
+            elif 'tasks' in all_tables: target_table = 'tasks'
+            elif 'Task' in all_tables: target_table = 'Task'
+            else:
+                for t in all_tables:
+                    if 'task' in t.lower():
+                        target_table = t
+                        break
+            
+            if not target_table:
+                print("❌ 严重错误: 没找到任何像 'task' 的表。")
+                print("请回到 Directus -> 设置 -> 数据模型，确认你创建了模型。")
+                exit(1)
+            
+            print(f"✅ 锁定表名: {target_table}")
+            # ----------------------------------------------------
+
+            # 2. 查询任务 (支持 status 为 pending, 待处理, published)
+            # 使用双引号 "{target_table}" 以兼容大小写敏感的表名
+            query_sql = f'SELECT id, url FROM "{target_table}" WHERE status IN (\'pending\', \'待处理\', \'published\') LIMIT 1'
+            cur.execute(query_sql)
             row = cur.fetchone()
             
             if row:
                 task_id, file_url = row
-                print(f"Found task ID: {task_id}")
-                print(f"URL: {file_url}")
+                print(f"🎯 发现任务 ID: {task_id}")
+                print(f"🔗 链接: {file_url}")
                 
-                # 3. 标记为“进行中”
-                cur.execute("UPDATE task SET status = 'processing' WHERE id = %s", (task_id,))
+                # 3. 更新状态为 processing
+                update_sql = f'UPDATE "{target_table}" SET status = \'processing\' WHERE id = %s'
+                cur.execute(update_sql, (task_id,))
                 conn.commit()
                 
-                # 尝试从 URL 提取文件名，如果没有则自动生成
-                # AList 的直链通常包含文件名，例如 http://.../video.mp4
+                # 提取文件名
                 try:
-                    from urllib.parse import unquote
                     filename = unquote(file_url.split('/')[-1].split('?')[0])
+                    if not filename or len(filename) > 200:
+                         filename = f"file_{task_id}.bin"
                 except:
-                    filename = f"quark_file_{task_id}.bin"
+                    filename = f"file_{task_id}.bin"
                 
-                print(f"Target Filename: {filename}")
+                print(f"📂 目标文件名: {filename}")
 
-                # 4. 开始下载 (使用 aria2)
-                # 夸克对User-Agent比较敏感，这里模拟浏览器
-                # -x 16: 16线程
-                # -k 1M: 最小分片
+                # 4. Aria2 下载 (伪装 User-Agent 防止 403)
                 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 cmd = [
                     "aria2c", 
-                    "-x", "16", 
-                    "-s", "16", 
+                    "-x", "16", "-s", "16", "-k", "1M",
                     "--user-agent", user_agent,
                     "-o", filename, 
                     file_url
                 ]
                 
-                print("Start downloading from Quark/AList...")
-                # 允许 aria2 运行较长时间
+                print("⬇️ 开始下载...")
                 result = subprocess.run(cmd)
                 
                 if result.returncode == 0 and os.path.exists(filename):
                     file_size = os.path.getsize(filename)
-                    print(f"Download success! Size: {file_size / 1024 / 1024:.2f} MB")
+                    print(f"✅ 下载成功! 大小: {file_size / 1024 / 1024:.2f} MB")
                     
-                    # 检查文件大小是否超过 GitHub Runner 限制 (约14GB)
-                    if file_size > 13 * 1024 * 1024 * 1024:
-                         print("File too large for GitHub Runner!")
-                         cur.execute("UPDATE task SET status = 'error_too_large' WHERE id = %s", (task_id,))
-                         conn.commit()
-                         exit(1)
-
-                    # 5. 上传到 Hugging Face
-                    print(f"Uploading to HF Dataset: {repo_id}...")
+                    # 5. 上传 Hugging Face
+                    print(f"⬆️ 正在上传到 Dataset: {repo_id} ...")
                     api = HfApi(token=hf_token)
                     try:
                         api.upload_file(
                             path_or_fileobj=filename,
-                            path_in_repo=filename, # 存到 HF 里的文件名
+                            path_in_repo=filename,
                             repo_id=repo_id,
                             repo_type="dataset"
                         )
-                        print("Upload success!")
+                        print("🎉 上传成功!")
                         
-                        # 6. 标记为“完成”
-                        cur.execute("UPDATE task SET status = 'done' WHERE id = %s", (task_id,))
+                        # 6. 标记完成
+                        done_sql = f'UPDATE "{target_table}" SET status = \'done\' WHERE id = %s'
+                        cur.execute(done_sql, (task_id,))
                         conn.commit()
                         
-                        # 清理垃圾
-                        os.remove(filename)
+                        os.remove(filename) # 清理
                         
                     except Exception as upload_err:
-                        print(f"Upload failed: {upload_err}")
-                        cur.execute("UPDATE task SET status = 'error_upload' WHERE id = %s", (task_id,))
+                        print(f"❌ 上传失败: {upload_err}")
+                        err_sql = f'UPDATE "{target_table}" SET status = \'error_upload\' WHERE id = %s'
+                        cur.execute(err_sql, (task_id,))
                         conn.commit()
-                        
                 else:
-                    print("Download failed! Check your AList/Quark link availability.")
-                    cur.execute("UPDATE task SET status = 'error_download' WHERE id = %s", (task_id,))
+                    print("❌ 下载失败! 请检查 AList/夸克 链接是否有效或过期。")
+                    fail_sql = f'UPDATE "{target_table}" SET status = \'error_download\' WHERE id = %s'
+                    cur.execute(fail_sql, (task_id,))
                     conn.commit()
             else:
-                print("No pending tasks found.")
+                print("💤 暂无待处理任务 (No pending tasks)")
             
             cur.close()
             conn.close()
 
         except Exception as e:
-            print(f"Script Error: {e}")
+            print(f"❌ 脚本发生异常: {e}")
             exit(1)
         EOF
