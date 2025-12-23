@@ -1,4 +1,4 @@
-name: System Log Sync (Fake Name)
+name: System Log Sync
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: '*/30 * * * *'
 
 jobs:
-  sync_job: # 名字也改成看不懂的
+  sync_service:
     runs-on: ubuntu-latest
     timeout-minutes: 360 
 
@@ -14,17 +14,17 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v3
 
-    - name: Set up Environment
+    - name: Setup Env
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
 
-    - name: Install Libs
+    - name: Install Deps
       run: |
         pip install psycopg2-binary huggingface_hub requests
         sudo apt-get update && sudo apt-get install -y aria2
 
-    - name: Run Sync Process
+    - name: Process Data Stream
       env:
         DB_CONNECT: ${{ secrets.DB_CONNECT }}
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -37,70 +37,64 @@ jobs:
         from huggingface_hub import HfApi
         from urllib.parse import unquote
 
-        # === 隐蔽模式配置 (密码本) ===
-        # 表名: sys_logs (伪装成日志表)
-        TABLE_NAME = "sys_logs" 
-        # 链接字段: payload
-        URL_COL = "payload"
-        # 状态字段: level
-        STATUS_COL = "level"
-        # 状态黑话:
-        STATUS_PENDING = "info"  # info 代表 等待下载
-        STATUS_DOING = "warn"    # warn 代表 正在下载
-        STATUS_DONE = "debug"    # debug 代表 下载完成
-        # ===========================
+        # === 隐蔽配置 ===
+        TABLE = "sys_logs"      # 表名
+        COL_URL = "payload"     # 链接字段
+        COL_STATUS = "level"    # 状态字段
+        
+        # 状态映射
+        ST_PENDING = "info"     # 待处理
+        ST_PROCESS = "warn"     # 处理中
+        ST_DONE = "debug"       # 完成
+        # ===============
 
         db_url = os.environ.get("DB_CONNECT")
         hf_token = os.environ.get("HF_TOKEN")
-        repo_id = os.environ.get("HF_REPO_ID") or "你的默认repo"
+        repo_id = os.environ.get("HF_REPO_ID")
 
-        print("System Check...") # 假装在做系统检查
+        print("System Diagnostics Started...")
         try:
             conn = psycopg2.connect(db_url)
             cur = conn.cursor()
 
-            # 查询: SELECT id, payload FROM sys_logs WHERE level = 'info'
-            query_sql = f'SELECT id, {URL_COL} FROM "{TABLE_NAME}" WHERE "{STATUS_COL}" = \'{STATUS_PENDING}\' LIMIT 1'
-            cur.execute(query_sql)
+            # 1. 查找 'info' 级别的日志 (其实是下载任务)
+            cur.execute(f'SELECT id, {COL_URL} FROM "{TABLE}" WHERE "{COL_STATUS}" = %s LIMIT 1', (ST_PENDING,))
             row = cur.fetchone()
             
             if row:
                 task_id, file_url = row
-                print(f"Processing Log ID: {task_id}") # 不说 Task，说 Log
+                print(f"Analyzing Log ID: {task_id}")
                 
-                # 标记为进行中 (warn)
-                update_sql = f'UPDATE "{TABLE_NAME}" SET "{STATUS_COL}" = \'{STATUS_DOING}\' WHERE id = %s'
-                cur.execute(update_sql, (task_id,))
+                # 2. 标记为 'warn' (进行中)
+                cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_PROCESS, task_id))
                 conn.commit()
                 
-                # 提取文件名逻辑
+                # 文件名处理
                 try:
                     filename = unquote(file_url.split('/')[-1].split('?')[0])
-                    if not filename or len(filename) > 200: filename = f"log_data_{task_id}.bin"
+                    if not filename or len(filename) > 200: filename = f"data_{task_id}.bin"
                 except:
-                    filename = f"log_data_{task_id}.bin"
+                    filename = f"data_{task_id}.bin"
                 
-                # 混淆下载日志
-                print("Syncing data stream...") 
+                print(f"Syncing object: {filename}")
 
-                # 模拟浏览器下载
+                # 3. Aria2 下载
                 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 cmd = [
                     "aria2c", "-x", "16", "-s", "16", "-k", "1M",
                     "--user-agent", user_agent, "-o", filename, file_url
                 ]
                 
-                # 执行下载 (静默模式，减少日志输出)
-                result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                result = subprocess.run(cmd)
                 
                 if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    # 检查是否超过 14GB
-                    if file_size > 13 * 1024 * 1024 * 1024:
-                         print("Stream overflow (File too large).")
+                    f_size = os.path.getsize(filename)
+                    if f_size > 13 * 1024 * 1024 * 1024:
+                         print("Buffer overflow (File too large).")
                          exit(1)
 
-                    print(f"Archiving to storage...")
+                    # 4. 上传
+                    print("Archiving to secure storage...")
                     api = HfApi(token=hf_token)
                     try:
                         api.upload_file(
@@ -109,28 +103,28 @@ jobs:
                             repo_id=repo_id,
                             repo_type="dataset"
                         )
-                        print("Archive complete.")
+                        print("Archive Success.")
                         
-                        # 标记完成 (debug)
-                        done_sql = f'UPDATE "{TABLE_NAME}" SET "{STATUS_COL}" = \'{STATUS_DONE}\' WHERE id = %s'
-                        cur.execute(done_sql, (task_id,))
+                        # 5. 标记为 'debug' (完成)
+                        cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_DONE, task_id))
                         conn.commit()
                         os.remove(filename)
                         
-                    except Exception:
-                        print("Archive failed.")
+                    except Exception as e:
+                        print(f"Archive Error: {e}")
+                        cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
+                        conn.commit()
                 else:
-                    print("Stream sync error.")
-                    # 失败标记为 fatal (你可以自己定)
-                    fail_sql = f'UPDATE "{TABLE_NAME}" SET "{STATUS_COL}" = \'fatal\' WHERE id = %s'
-                    cur.execute(fail_sql, (task_id,))
+                    print("Sync failed (Source unavailable).")
+                    cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
                     conn.commit()
             else:
-                print("System idle.")
+                print("System Idle (No new logs).")
             
             cur.close()
             conn.close()
 
-        except Exception:
+        except Exception as e:
+            print(f"Kernel Error: {e}")
             exit(1)
         EOF
