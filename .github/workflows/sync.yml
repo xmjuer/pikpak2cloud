@@ -1,4 +1,4 @@
-name: 小猪佩奇
+name: A小猪佩奇
 
 on:
   workflow_dispatch:
