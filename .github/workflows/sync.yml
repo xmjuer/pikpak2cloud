@@ -1,0 +1,182 @@
+name: System Log Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *' # 默认半小时，保持不变
+
+jobs:
+  sync_service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Env
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Deps
+      run: |
+        pip install psycopg2-binary huggingface_hub requests
+        sudo apt-get update && sudo apt-get install -y aria2
+
+    - name: Process Stream
+      id: transfer
+      env:
+        DB_CONNECT: ${{ secrets.DB_CONNECT }}
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+      run: |
+        python <<EOF
+        import os
+        import psycopg2
+        import subprocess
+        from huggingface_hub import HfApi
+        from urllib.parse import unquote
+
+        # === 配置 ===
+        TABLE = "sys_logs"
+        COL_URL = "payload"
+        COL_STATUS = "level"
+        COL_FOLDER = "folder" # 确保数据库里字段名是这个
+        ST_PENDING = "info"
+        ST_PROCESS = "warn"
+        ST_DONE = "debug"
+        # ==========
+
+        db_url = os.environ.get("DB_CONNECT")
+        hf_token = os.environ.get("HF_TOKEN")
+        repo_id = os.environ.get("HF_REPO_ID")
+
+        print("System Diagnostics Started...")
+        try:
+            conn = psycopg2.connect(db_url)
+            cur = conn.cursor()
+
+            # 1. 查找任务 (显式读取 folder 字段)
+            # 如果这里报错，说明数据库里缺字段，或者权限没开
+            try:
+                cur.execute(f'SELECT id, {COL_URL}, {COL_FOLDER} FROM "{TABLE}" WHERE "{COL_STATUS}" = %s LIMIT 1', (ST_PENDING,))
+            except Exception as e:
+                print(f"❌ Database Query Error: {e}")
+                print("请检查 Directus 权限：Public 角色是否开启了 folder 字段的读取权限？")
+                exit(1)
+
+            row = cur.fetchone()
+            
+            if row:
+                task_id, file_url, folder_name = row
+                
+                # --- 文件夹名称清洗逻辑 ---
+                if folder_name is None:
+                    folder_name = "Downloads" # 默认文件夹
+                else:
+                    folder_name = str(folder_name).strip() # 去除首尾空格
+                    if folder_name == "":
+                        folder_name = "Downloads"
+                
+                # 去除可能导致路径错误的字符
+                folder_name = folder_name.replace("..", "").strip("/")
+                # -----------------------
+
+                print(f"✅ Analyzing Log ID: {task_id}")
+                print(f"📂 Target Folder: [{folder_name}]") 
+                
+                # 2. 标记为进行中
+                cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_PROCESS, task_id))
+                conn.commit()
+                
+                try:
+                    # 提取文件名
+                    filename = unquote(file_url.split('/')[-1].split('?')[0])
+                    if not filename or len(filename) > 200: filename = f"data_{task_id}.bin"
+                except:
+                    filename = f"data_{task_id}.bin"
+                
+                print(f"⬇️ Syncing object: {filename}")
+
+                # 3. Aria2 下载
+                user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                cmd = [
+                    "aria2c", "-x", "16", "-s", "16", "-k", "1M",
+                    "--user-agent", user_agent, "-o", filename, file_url
+                ]
+                
+                result = subprocess.run(cmd)
+                
+                if result.returncode == 0 and os.path.exists(filename):
+                    f_size = os.path.getsize(filename)
+                    if f_size > 14 * 1024 * 1024 * 1024:
+                         print("Buffer overflow (File too large).")
+                         exit(1)
+
+                    # 4. 上传到 Hugging Face (强制带路径)
+                    # 最终路径格式: 文件夹/文件名
+                    final_path = f"{folder_name}/{filename}"
+                    print(f"⬆️ Uploading to: {final_path}")
+                    
+                    api = HfApi(token=hf_token)
+                    try:
+                        api.upload_file(
+                            path_or_fileobj=filename,
+                            path_in_repo=final_path, # 这里决定了 Dataset 里的文件夹结构
+                            repo_id=repo_id,
+                            repo_type="dataset"
+                        )
+                        print("🎉 Archive Success.")
+                        
+                        # 5. 标记完成
+                        cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', (ST_DONE, task_id))
+                        conn.commit()
+                        os.remove(filename)
+                        
+                        # 写入环境变量供邮件使用
+                        with open(os.environ['GITHUB_ENV'], 'a') as f:
+                            f.write(f"SYNC_FILENAME={filename}\n")
+                            f.write(f"SYNC_FOLDER={folder_name}\n")
+
+                    except Exception as e:
+                        print(f"❌ Upload Error: {e}")
+                        cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
+                        conn.commit()
+                        exit(1)
+                else:
+                    print("❌ Download failed.")
+                    cur.execute(f'UPDATE "{TABLE}" SET "{COL_STATUS}" = %s WHERE id = %s', ('fatal', task_id))
+                    conn.commit()
+                    exit(1)
+            else:
+                print("💤 System Idle.")
+            
+            cur.close()
+            conn.close()
+
+        except Exception as e:
+            print(f"Kernel Error: {e}")
+            exit(1)
+        EOF
+
+    # 邮件通知
+    - name: Notify Success
+      if: success() && env.SYNC_FILENAME != ''
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.qq.com
+        server_port: 465
+        username: ${{ secrets.MAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: ✅ [已归档] ${{ env.SYNC_FILENAME }}
+        body: |
+          文件已成功转存至 Hugging Face Dataset。
+          
+          📂 归档目录: ${{ env.SYNC_FOLDER }}
+          📄 文件名称: ${{ env.SYNC_FILENAME }}
+          
+          查看仓库: https://huggingface.co/datasets/${{ secrets.HF_REPO_ID }}/tree/main/${{ env.SYNC_FOLDER }}
+        to: ${{ secrets.MAIL_USERNAME }}
+        from: CloudStream Bot
+        secure: true
