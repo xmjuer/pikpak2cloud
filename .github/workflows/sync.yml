@@ -1,4 +1,4 @@
-name: System Log Sync
+name: 小猪佩奇
 
 on:
   workflow_dispatch:
